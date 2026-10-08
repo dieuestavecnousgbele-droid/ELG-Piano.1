@@ -1821,11 +1821,18 @@ fun PianoKeyboard(
                     )
                     val label = labelFor(key.midi, showNoteNames)
                     if (label != null) {
-                        drawText(
-                            textMeasurer = textMeasurer,
+                        // measure() sans contrainte de largeur dépendante de la position :
+                        // drawText(textMeasurer, text, topLeft) calcule maxWidth = largeur du canvas - topLeft.x,
+                        // ce qui devient négatif pour les touches situées après le bord visible (crash).
+                        val labelLayout = textMeasurer.measure(
                             text = label,
-                            topLeft = Offset(key.x + 5f, size.height - 30f),
-                            style = labelStyle
+                            style = labelStyle,
+                            softWrap = false,
+                            maxLines = 1
+                        )
+                        drawText(
+                            textLayoutResult = labelLayout,
+                            topLeft = Offset(key.x + 5f, size.height - 30f)
                         )
                     }
                 }
@@ -2304,68 +2311,90 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
       contents: read
 
     steps:
-      - name: Récupérer le dépôt
-        uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v5
         with:
           lfs: true
 
-      - name: Installer Java 17
-        uses: actions/setup-java@v4
+      - name: Setup Java 17
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Récupérer les SoundFonts depuis la Release "soundfonts" si absents
+      # Le dépôt ne contient que setup_elg_piano_full.sh :
+      # ce script génère app/, Gradle, le code C++/Kotlin, etc.
+      - name: Generate project from setup script
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash setup_elg_piano_full.sh
+          ls -la
+          ls -la app/src/main/cpp
+
+      - name: Download SoundFonts from Release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           mkdir -p app/src/main/assets/soundfonts
           for f in StudioOne_Steinway_B.sf2 Bright_Synth.sf2; do
             p="app/src/main/assets/soundfonts/$f"
             if [ ! -s "$p" ]; then
-              gh release download soundfonts --repo "$GITHUB_REPOSITORY" --pattern "$f" --dir app/src/main/assets/soundfonts \
-                || { echo "Impossible de télécharger $f depuis la Release 'soundfonts'"; exit 1; }
+              gh release download soundfonts --repo "$GITHUB_REPOSITORY" \
+                --pattern "$f" --dir app/src/main/assets/soundfonts --clobber
             fi
           done
+          ls -lh app/src/main/assets/soundfonts
 
-      - name: Vérifier les SoundFonts
+      - name: Verify SoundFonts
+        shell: bash
         run: |
+          set -euo pipefail
           for f in StudioOne_Steinway_B.sf2 Bright_Synth.sf2; do
             p="app/src/main/assets/soundfonts/$f"
-            test -s "$p" || { echo "SoundFont manquant : $p"; exit 1; }
-            test "$(head -c 4 "$p")" = "RIFF" || { echo "Fichier invalide (pointeur LFS ?) : $p"; exit 1; }
+            test -s "$p" || { echo "Missing SoundFont: $p"; exit 1; }
+            test "$(head -c 4 "$p")" = "RIFF" || { echo "Invalid SoundFont: $p"; exit 1; }
           done
 
-      - name: Télécharger TinySoundFont si absent
+      - name: Ensure TinySoundFont (tsf.h)
+        shell: bash
         run: |
-          if [ ! -s app/src/main/cpp/tsf.h ]; then
-            curl -fsSL -o app/src/main/cpp/tsf.h \
+          set -euo pipefail
+          mkdir -p app/src/main/cpp
+          if ! grep -qs TSF_IMPLEMENTATION app/src/main/cpp/tsf.h; then
+            curl -fsSL --retry 3 --retry-delay 2 \
+              -o "$RUNNER_TEMP/tsf.h" \
               https://raw.githubusercontent.com/schellingb/TinySoundFont/master/tsf.h
+            mv "$RUNNER_TEMP/tsf.h" app/src/main/cpp/tsf.h
           fi
           grep -q TSF_IMPLEMENTATION app/src/main/cpp/tsf.h
 
-      - name: Installer SDK, NDK et CMake
+      - name: Install Android SDK, NDK and CMake
+        shell: bash
         run: |
+          set -eu
           SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           yes | "$SDKMANAGER" --licenses > /dev/null || true
           "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0" "ndk;27.0.12077973" "cmake;3.22.1"
 
-      - name: Installer Gradle
-        uses: gradle/actions/setup-gradle@v4
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v5
         with:
           gradle-version: '8.9'
 
-      - name: Compiler l'APK de debug
+      - name: Build Debug APK
         run: gradle --no-daemon assembleDebug
 
-      - name: Publier l'APK
-        uses: actions/upload-artifact@v4
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v5
         with:
           name: ELG-Piano-debug-apk
           path: app/build/outputs/apk/debug/*.apk
