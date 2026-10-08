@@ -1,0 +1,2497 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  ELG Piano - setup_elg_piano_full.sh
+#  Étape 1 (v0.2.0) : clavier 88 touches paysage + zoom 7-21 touches, moteur
+#  Oboe/TinySoundFont, réverbération, pédale forte, MIDI USB/Bluetooth, 2 SF2
+#  Compilation prévue sur GitHub Actions (workflow généré).
+#
+#  Usage : placer ce script, StudioOne_Steinway_B.sf2 et Bright_Synth.sf2 dans le
+#          même dossier (racine du dépôt Git), puis :  bash setup_elg_piano_full.sh
+# =============================================================================
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="${ELG_PIANO_DIR:-$SCRIPT_DIR}"
+ASSETS_DIR="$PROJECT_DIR/app/src/main/assets/soundfonts"
+CPP_DIR="$PROJECT_DIR/app/src/main/cpp"
+PKG_DIR="$PROJECT_DIR/app/src/main/java/com/elg/piano"
+UI_DIR="$PKG_DIR/ui"
+MIDI_DIR="$PKG_DIR/midi"
+RES_DIR="$PROJECT_DIR/app/src/main/res"
+WORKFLOW_DIR="$PROJECT_DIR/.github/workflows"
+SF2_FILES=("StudioOne_Steinway_B.sf2" "Bright_Synth.sf2")
+TSF_URL="https://raw.githubusercontent.com/schellingb/TinySoundFont/master/tsf.h"
+
+log()  { printf '\033[1;34m[ELG Piano]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[ATTENTION]\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31m[ERREUR]\033[0m %s\n' "$*" >&2; exit 1; }
+
+# Vérifie l'en-tête RIFF....sfbk d'un fichier SoundFont 2
+is_sf2() {
+  [ -f "$1" ] || return 1
+  [ "$(head -c 4 "$1")" = "RIFF" ] || return 1
+  [ "$(dd if="$1" bs=1 skip=8 count=4 2>/dev/null)" = "sfbk" ] || return 1
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# 1. SoundFonts : recherche, validation, copie dans assets
+# -----------------------------------------------------------------------------
+log "Étape 1/7 : SoundFonts"
+mkdir -p "$ASSETS_DIR"
+for f in "${SF2_FILES[@]}"; do
+  target="$ASSETS_DIR/$f"
+  if ! is_sf2 "$target"; then
+    found=""
+    for dir in "$SCRIPT_DIR" "$SCRIPT_DIR/soundfonts" "$PWD" "$PWD/soundfonts"; do
+      if is_sf2 "$dir/$f"; then found="$dir/$f"; break; fi
+    done
+    if [ -z "$found" ]; then
+      warn "SoundFont absent en local : $f (il sera téléchargé depuis la Release 'soundfonts' par GitHub Actions)."
+      continue
+    fi
+    cp "$found" "$target"
+  fi
+  log "  OK : $f ($(wc -c < "$target") octets)"
+done
+
+# -----------------------------------------------------------------------------
+# 2. Racine Gradle
+# -----------------------------------------------------------------------------
+log "Étape 2/7 : fichiers Gradle"
+mkdir -p "$PROJECT_DIR"
+cat > "$PROJECT_DIR/settings.gradle.kts" <<'EOF_SETTINGS'
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = "ELG Piano"
+include(":app")
+EOF_SETTINGS
+
+mkdir -p "$PROJECT_DIR"
+cat > "$PROJECT_DIR/build.gradle.kts" <<'EOF_ROOTGRADLE'
+plugins {
+    id("com.android.application") version "8.7.3" apply false
+    id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+    id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
+}
+EOF_ROOTGRADLE
+
+mkdir -p "$PROJECT_DIR"
+cat > "$PROJECT_DIR/gradle.properties" <<'EOF_GRADLEPROPS'
+org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+org.gradle.parallel=true
+android.useAndroidX=true
+android.nonTransitiveRClass=true
+kotlin.code.style=official
+EOF_GRADLEPROPS
+
+mkdir -p "$PROJECT_DIR"
+cat > "$PROJECT_DIR/.gitignore" <<'EOF_GITIGNORE'
+*.iml
+.gradle/
+.idea/
+build/
+app/build/
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+EOF_GITIGNORE
+
+mkdir -p "$PROJECT_DIR/app"
+cat > "$PROJECT_DIR/app/build.gradle.kts" <<'EOF_APPGRADLE'
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
+}
+
+android {
+    namespace = "com.elg.piano"
+    compileSdk = 35
+    ndkVersion = "27.0.12077973"
+
+    defaultConfig {
+        applicationId = "com.elg.piano"
+        minSdk = 29
+        targetSdk = 35
+        versionCode = 2
+        versionName = "0.2.0"
+
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+        }
+        externalNativeBuild {
+            cmake {
+                cppFlags += "-std=c++17"
+                arguments += listOf(
+                    "-DANDROID_STL=c++_shared",
+                    "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"
+                )
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+
+    buildFeatures {
+        compose = true
+        prefab = true
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
+
+    // Les SoundFonts ne sont pas recompressés : lecture/copie plus rapide.
+    androidResources {
+        noCompress += listOf("sf2")
+    }
+
+    packaging {
+        resources {
+            excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        }
+    }
+}
+
+dependencies {
+    implementation("androidx.core:core-ktx:1.15.0")
+    implementation("androidx.activity:activity-compose:1.9.3")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+
+    implementation(platform("androidx.compose:compose-bom:2024.10.01"))
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.ui:ui-graphics")
+    implementation("androidx.compose.foundation:foundation")
+    implementation("androidx.compose.animation:animation")
+    implementation("androidx.compose.material3:material3")
+
+    implementation("com.google.oboe:oboe:1.9.3")
+}
+EOF_APPGRADLE
+
+# -----------------------------------------------------------------------------
+# 3. Code natif : Oboe + TinySoundFont
+# -----------------------------------------------------------------------------
+log "Étape 3/7 : moteur audio natif (C++)"
+mkdir -p "$CPP_DIR"
+cat > "$CPP_DIR/CMakeLists.txt" <<'EOF_CMAKE'
+cmake_minimum_required(VERSION 3.22.1)
+project(elgpiano LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tsf.h")
+    message(FATAL_ERROR "tsf.h est introuvable dans app/src/main/cpp. Telechargez-le depuis https://github.com/schellingb/TinySoundFont (fichier tsf.h) ou relancez setup_elg_piano_full.sh avec acces Internet.")
+endif()
+
+find_package(oboe REQUIRED CONFIG)
+
+add_library(elgpiano SHARED
+    engine.cpp
+    tsf_impl.cpp)
+
+target_include_directories(elgpiano PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_options(elgpiano PRIVATE -O2 -Wall -Wno-unused-function)
+target_link_options(elgpiano PRIVATE -Wl,-z,max-page-size=16384)
+target_link_libraries(elgpiano oboe::oboe log)
+EOF_CMAKE
+
+mkdir -p "$CPP_DIR"
+cat > "$CPP_DIR/tsf_impl.cpp" <<'EOF_TSFIMPL'
+// Implémentation unique de TinySoundFont (en-tête tsf.h, licence MIT).
+#define TSF_IMPLEMENTATION
+#include "tsf.h"
+EOF_TSFIMPL
+
+mkdir -p "$CPP_DIR"
+cat > "$CPP_DIR/engine.cpp" <<'EOF_ENGINE'
+// ELG Piano v0.2 - moteur audio : Oboe (sortie faible latence) + TinySoundFont (SF2)
+// + réverbération stéréo (type Freeverb) + pédale forte + volume maître.
+//
+// Règles de conception :
+//  - Le thread audio ne charge ni ne libère aucun SoundFont, et ne prend aucun verrou bloquant.
+//  - Les notes et la pédale arrivent par une file de commandes sans verrou côté lecteur.
+//  - Les paramètres continus (réverbération, volume) sont des atomiques lus à chaque bloc audio.
+//  - Les SoundFonts se chargent à la demande ; ils ne sont jamais déchargés pendant l'exécution.
+
+#include <jni.h>
+#include <oboe/Oboe.h>
+#include <android/log.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <vector>
+
+#include "tsf.h"
+
+#define LOG_TAG "ELGPiano"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+namespace {
+
+constexpr int kMaxInstruments = 4;
+constexpr uint32_t kQueueSize = 1024;  // puissance de 2
+constexpr float kGainDb = -6.0f;       // marge pour la polyphonie
+
+enum CommandType : int {
+    CMD_NOTE_ON = 1,
+    CMD_NOTE_OFF = 2,
+    CMD_ALL_OFF = 3,
+    CMD_SET_INSTRUMENT = 4,
+    CMD_SUSTAIN = 5
+};
+
+struct Command {
+    int type;
+    int a;    // note MIDI, index d'instrument ou état de la pédale
+    float b;  // vélocité 0..1
+};
+
+// File de commandes : plusieurs producteurs (protégés par un mutex que le
+// thread audio ne prend jamais), un seul consommateur (thread audio).
+class CommandQueue {
+public:
+    CommandQueue() : mHead(0), mTail(0) {}
+
+    bool push(const Command& c) {
+        std::lock_guard<std::mutex> lock(mProducerMutex);
+        const uint32_t head = mHead.load(std::memory_order_relaxed);
+        const uint32_t next = (head + 1) & (kQueueSize - 1);
+        if (next == mTail.load(std::memory_order_acquire)) return false;  // pleine
+        mBuffer[head] = c;
+        mHead.store(next, std::memory_order_release);
+        return true;
+    }
+
+    bool pop(Command& c) {
+        const uint32_t tail = mTail.load(std::memory_order_relaxed);
+        if (tail == mHead.load(std::memory_order_acquire)) return false;  // vide
+        c = mBuffer[tail];
+        mTail.store((tail + 1) & (kQueueSize - 1), std::memory_order_release);
+        return true;
+    }
+
+private:
+    Command mBuffer[kQueueSize];
+    std::atomic<uint32_t> mHead;
+    std::atomic<uint32_t> mTail;
+    std::mutex mProducerMutex;
+};
+
+// ---------------------------------------------------------------------------
+// Réverbération de type Freeverb : 8 filtres en peigne + 4 filtres passe-tout
+// par canal, avec léger décalage stéréo.
+// ---------------------------------------------------------------------------
+class Comb {
+public:
+    void init(int size, float feedback, float damp) {
+        mBuf.assign(static_cast<size_t>(size > 0 ? size : 1), 0.0f);
+        mIdx = 0;
+        mStore = 0.0f;
+        mFeedback = feedback;
+        mDamp1 = damp;
+        mDamp2 = 1.0f - damp;
+    }
+
+    void clear() {
+        std::fill(mBuf.begin(), mBuf.end(), 0.0f);
+        mStore = 0.0f;
+    }
+
+    float process(float input) {
+        const float out = mBuf[mIdx];
+        mStore = out * mDamp2 + mStore * mDamp1;
+        if (std::fabs(mStore) < 1e-15f) mStore = 0.0f;  // évite les dénormaux
+        mBuf[mIdx] = input + mStore * mFeedback;
+        if (++mIdx >= static_cast<int>(mBuf.size())) mIdx = 0;
+        return out;
+    }
+
+private:
+    std::vector<float> mBuf;
+    int mIdx = 0;
+    float mStore = 0.0f;
+    float mFeedback = 0.84f;
+    float mDamp1 = 0.2f;
+    float mDamp2 = 0.8f;
+};
+
+class AllPass {
+public:
+    void init(int size) {
+        mBuf.assign(static_cast<size_t>(size > 0 ? size : 1), 0.0f);
+        mIdx = 0;
+    }
+
+    void clear() { std::fill(mBuf.begin(), mBuf.end(), 0.0f); }
+
+    float process(float input) {
+        const float bufOut = mBuf[mIdx];
+        const float out = -input + bufOut;
+        mBuf[mIdx] = input + bufOut * 0.5f;
+        if (++mIdx >= static_cast<int>(mBuf.size())) mIdx = 0;
+        return out;
+    }
+
+private:
+    std::vector<float> mBuf;
+    int mIdx = 0;
+};
+
+class Reverb {
+public:
+    static constexpr int kCombs = 8;
+    static constexpr int kAllpasses = 4;
+    static constexpr float kFeedback = 0.86f;  // taille de salle
+    static constexpr float kDamp = 0.25f;      // amortissement des aigus
+
+    // À appeler uniquement quand le flux audio n'est pas démarré.
+    void init(int sampleRate) {
+        static const int kCombTuning[kCombs] = {1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617};
+        static const int kAllpassTuning[kAllpasses] = {556, 441, 341, 225};
+        constexpr int kSpread = 23;
+        const float scale = static_cast<float>(sampleRate) / 44100.0f;
+        for (int i = 0; i < kCombs; ++i) {
+            mCombL[i].init(scaled(kCombTuning[i], scale), kFeedback, kDamp);
+            mCombR[i].init(scaled(kCombTuning[i] + kSpread, scale), kFeedback, kDamp);
+        }
+        for (int i = 0; i < kAllpasses; ++i) {
+            mAllL[i].init(scaled(kAllpassTuning[i], scale));
+            mAllR[i].init(scaled(kAllpassTuning[i] + kSpread, scale));
+        }
+    }
+
+    void clear() {
+        for (int i = 0; i < kCombs; ++i) {
+            mCombL[i].clear();
+            mCombR[i].clear();
+        }
+        for (int i = 0; i < kAllpasses; ++i) {
+            mAllL[i].clear();
+            mAllR[i].clear();
+        }
+    }
+
+    // io : tampon stéréo entrelacé, traité sur place. level : 0..1.
+    void process(float* io, int32_t frames, float level) {
+        const float wet = level * 1.5f;
+        const float dry = 1.0f - 0.25f * level;
+        for (int32_t f = 0; f < frames; ++f) {
+            const float inL = io[2 * f];
+            const float inR = io[2 * f + 1];
+            const float input = (inL + inR) * 0.015f;
+            float outL = 0.0f;
+            float outR = 0.0f;
+            for (int i = 0; i < kCombs; ++i) {
+                outL += mCombL[i].process(input);
+                outR += mCombR[i].process(input);
+            }
+            for (int i = 0; i < kAllpasses; ++i) {
+                outL = mAllL[i].process(outL);
+                outR = mAllR[i].process(outR);
+            }
+            io[2 * f] = inL * dry + outL * wet;
+            io[2 * f + 1] = inR * dry + outR * wet;
+        }
+    }
+
+private:
+    static int scaled(int tuning, float scale) {
+        return std::max(1, static_cast<int>(static_cast<float>(tuning) * scale));
+    }
+
+    Comb mCombL[kCombs];
+    Comb mCombR[kCombs];
+    AllPass mAllL[kAllpasses];
+    AllPass mAllR[kAllpasses];
+};
+
+class Engine;
+
+class DataCallback : public oboe::AudioStreamDataCallback {
+public:
+    explicit DataCallback(Engine* engine) : mEngine(engine) {}
+    oboe::DataCallbackResult onAudioReady(oboe::AudioStream* stream,
+                                          void* audioData,
+                                          int32_t numFrames) override;
+
+private:
+    Engine* mEngine;
+};
+
+class ErrorCallback : public oboe::AudioStreamErrorCallback {
+public:
+    explicit ErrorCallback(Engine* engine) : mEngine(engine) {}
+    void onErrorAfterClose(oboe::AudioStream* stream, oboe::Result error) override;
+
+private:
+    Engine* mEngine;
+};
+
+class Engine {
+public:
+    Engine()
+        : mDataCb(std::make_shared<DataCallback>(this)),
+          mErrCb(std::make_shared<ErrorCallback>(this)),
+          mSampleRate(0),
+          mStopped(false),
+          mPaused(false),
+          mReverbLevel(0.3f),
+          mVolume(0.8f),
+          mActive(0),
+          mSustain(false),
+          mReverbActive(false),
+          mLastVolume(0.8f) {
+        for (int i = 0; i < kMaxInstruments; ++i) mFonts[i].store(nullptr);
+        std::memset(mPending, 0, sizeof(mPending));
+    }
+
+    ~Engine() { stop(); }
+
+    // Ouvre le flux audio. Retourne la fréquence d'échantillonnage, ou 0 si échec.
+    int start() {
+        std::lock_guard<std::mutex> lock(mStreamMutex);
+        mStopped = false;
+        if (mStream) return mSampleRate.load();
+        return openStreamLocked() ? mSampleRate.load() : 0;
+    }
+
+    void stop() {
+        std::lock_guard<std::mutex> lock(mStreamMutex);
+        mStopped = true;
+        if (mStream) {
+            mStream->requestStop();
+            mStream->close();
+            mStream.reset();
+        }
+        for (int i = 0; i < kMaxInstruments; ++i) {
+            tsf* f = mFonts[i].exchange(nullptr);
+            if (f) tsf_close(f);
+        }
+    }
+
+    void pause() {
+        std::lock_guard<std::mutex> lock(mStreamMutex);
+        mPaused = true;
+        if (mStream) mStream->requestPause();
+    }
+
+    void resume() {
+        std::lock_guard<std::mutex> lock(mStreamMutex);
+        mPaused = false;
+        if (mStream) mStream->requestStart();
+    }
+
+    // Charge un SoundFont depuis un fichier (appelé hors thread audio).
+    bool loadFont(int index, const char* path) {
+        if (index < 0 || index >= kMaxInstruments || path == nullptr) return false;
+        if (mFonts[index].load(std::memory_order_acquire) != nullptr) return true;
+        const int rate = mSampleRate.load();
+        if (rate <= 0) {
+            LOGE("loadFont: flux audio non démarré");
+            return false;
+        }
+        tsf* f = tsf_load_filename(path);
+        if (f == nullptr) {
+            LOGE("loadFont: échec de lecture de %s", path);
+            return false;
+        }
+        tsf_set_output(f, TSF_STEREO_INTERLEAVED, rate, kGainDb);
+        mFonts[index].store(f, std::memory_order_release);
+        LOGI("SoundFont %d chargé (%d Hz)", index, rate);
+        return true;
+    }
+
+    void send(int type, int a, float b) {
+        Command c;
+        c.type = type;
+        c.a = a;
+        c.b = b;
+        mQueue.push(c);
+    }
+
+    void setReverb(float level) {
+        mReverbLevel.store(std::min(1.0f, std::max(0.0f, level)), std::memory_order_relaxed);
+    }
+
+    void setVolume(float volume) {
+        mVolume.store(std::min(1.0f, std::max(0.0f, volume)), std::memory_order_relaxed);
+    }
+
+    // Appelé uniquement par le thread audio.
+    void render(float* out, int32_t frames) {
+        processCommands();
+
+        tsf* font = mFonts[mActive].load(std::memory_order_acquire);
+        const int32_t samples = frames * 2;
+        if (font == nullptr) {
+            std::memset(out, 0, sizeof(float) * static_cast<size_t>(samples));
+        } else {
+            tsf_render_float(font, out, frames, 0);
+        }
+
+        // Réverbération (coupée complètement à 0 pour économiser le processeur).
+        const float level = mReverbLevel.load(std::memory_order_relaxed);
+        if (level > 0.001f) {
+            if (!mReverbActive) {
+                mReverb.clear();
+                mReverbActive = true;
+            }
+            mReverb.process(out, frames, level);
+        } else {
+            mReverbActive = false;
+        }
+
+        // Volume maître avec rampe (évite les craquements) puis écrêtage de sécurité.
+        const float target = mVolume.load(std::memory_order_relaxed);
+        float v = mLastVolume;
+        const float step = (target - v) / static_cast<float>(frames > 0 ? frames : 1);
+        for (int32_t f = 0; f < frames; ++f) {
+            v += step;
+            for (int c = 0; c < 2; ++c) {
+                float s = out[2 * f + c] * v;
+                if (s > 1.0f) s = 1.0f;
+                else if (s < -1.0f) s = -1.0f;
+                out[2 * f + c] = s;
+            }
+        }
+        mLastVolume = target;
+    }
+
+    // Réouverture après déconnexion (casque débranché, changement de sortie...).
+    void reopen() {
+        std::unique_lock<std::mutex> lock(mStreamMutex, std::try_to_lock);
+        if (!lock.owns_lock() || mStopped) return;
+        mStream.reset();
+        if (!openStreamLocked()) LOGE("reopen: échec");
+    }
+
+private:
+    // Traite les commandes en attente (thread audio).
+    void processCommands() {
+        Command c;
+        while (mQueue.pop(c)) {
+            tsf* cur = mFonts[mActive].load(std::memory_order_acquire);
+            switch (c.type) {
+                case CMD_NOTE_ON:
+                    if (cur && c.a >= 0 && c.a < 128) {
+                        if (mPending[c.a]) {  // touche rejouée avant la fin de la pédale
+                            tsf_note_off(cur, 0, c.a);
+                            mPending[c.a] = false;
+                        }
+                        tsf_note_on(cur, 0, c.a, c.b);
+                    }
+                    break;
+                case CMD_NOTE_OFF:
+                    if (c.a >= 0 && c.a < 128) {
+                        if (mSustain) {
+                            mPending[c.a] = true;  // relâchement différé par la pédale
+                        } else if (cur) {
+                            tsf_note_off(cur, 0, c.a);
+                        }
+                    }
+                    break;
+                case CMD_SUSTAIN: {
+                    const bool on = c.a != 0;
+                    if (mSustain && !on) releasePending(cur);
+                    mSustain = on;
+                    break;
+                }
+                case CMD_ALL_OFF:
+                    if (cur) tsf_note_off_all(cur);
+                    std::memset(mPending, 0, sizeof(mPending));
+                    break;
+                case CMD_SET_INSTRUMENT:
+                    if (c.a >= 0 && c.a < kMaxInstruments && c.a != mActive) {
+                        if (cur) tsf_reset(cur);  // coupe net l'ancien instrument
+                        std::memset(mPending, 0, sizeof(mPending));
+                        mActive = c.a;
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+
+    void releasePending(tsf* cur) {
+        for (int k = 0; k < 128; ++k) {
+            if (mPending[k]) {
+                if (cur) tsf_note_off(cur, 0, k);
+                mPending[k] = false;
+            }
+        }
+    }
+
+    bool openStreamLocked() {
+        oboe::AudioStreamBuilder builder;
+        builder.setDirection(oboe::Direction::Output)
+            ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
+            ->setSharingMode(oboe::SharingMode::Exclusive)
+            ->setFormat(oboe::AudioFormat::Float)
+            ->setChannelCount(oboe::ChannelCount::Stereo)
+            ->setUsage(oboe::Usage::Media)
+            ->setContentType(oboe::ContentType::Music)
+            ->setDataCallback(mDataCb)
+            ->setErrorCallback(mErrCb);
+
+        const oboe::Result result = builder.openStream(mStream);
+        if (result != oboe::Result::OK) {
+            LOGE("openStream: %s", oboe::convertToText(result));
+            mStream.reset();
+            return false;
+        }
+
+        mSampleRate.store(mStream->getSampleRate());
+        mStream->setBufferSizeInFrames(mStream->getFramesPerBurst() * 2);
+
+        // Le flux n'est pas encore démarré : on peut ajuster SoundFonts et réverbération sans risque.
+        for (int i = 0; i < kMaxInstruments; ++i) {
+            tsf* f = mFonts[i].load(std::memory_order_acquire);
+            if (f) tsf_set_output(f, TSF_STEREO_INTERLEAVED, mSampleRate.load(), kGainDb);
+        }
+        mReverb.init(mSampleRate.load());
+        mReverbActive = false;
+
+        if (!mPaused) {
+            const oboe::Result startResult = mStream->requestStart();
+            if (startResult != oboe::Result::OK) {
+                LOGE("requestStart: %s", oboe::convertToText(startResult));
+                mStream->close();
+                mStream.reset();
+                return false;
+            }
+        }
+        LOGI("Flux audio ouvert : %d Hz, burst %d trames",
+             mSampleRate.load(), mStream->getFramesPerBurst());
+        return true;
+    }
+
+    std::shared_ptr<DataCallback> mDataCb;
+    std::shared_ptr<ErrorCallback> mErrCb;
+    std::shared_ptr<oboe::AudioStream> mStream;
+    std::mutex mStreamMutex;
+    std::atomic<int> mSampleRate;
+    std::atomic<bool> mStopped;
+    std::atomic<bool> mPaused;
+    std::atomic<float> mReverbLevel;
+    std::atomic<float> mVolume;
+    std::atomic<tsf*> mFonts[kMaxInstruments];
+    CommandQueue mQueue;
+
+    // État réservé au thread audio.
+    int mActive;
+    bool mSustain;
+    bool mPending[128];
+    bool mReverbActive;
+    float mLastVolume;
+    Reverb mReverb;
+};
+
+oboe::DataCallbackResult DataCallback::onAudioReady(oboe::AudioStream*,
+                                                    void* audioData,
+                                                    int32_t numFrames) {
+    mEngine->render(static_cast<float*>(audioData), numFrames);
+    return oboe::DataCallbackResult::Continue;
+}
+
+void ErrorCallback::onErrorAfterClose(oboe::AudioStream*, oboe::Result error) {
+    LOGE("Flux fermé sur erreur : %s", oboe::convertToText(error));
+    mEngine->reopen();
+}
+
+std::mutex gEngineMutex;
+std::shared_ptr<Engine> gEngine;
+
+std::shared_ptr<Engine> getEngine() {
+    std::lock_guard<std::mutex> lock(gEngineMutex);
+    return gEngine;
+}
+
+}  // namespace
+
+extern "C" {
+
+JNIEXPORT jint JNICALL
+Java_com_elg_piano_NativeEngine_nativeStart(JNIEnv*, jobject) {
+    std::shared_ptr<Engine> engine;
+    {
+        std::lock_guard<std::mutex> lock(gEngineMutex);
+        if (!gEngine) gEngine = std::make_shared<Engine>();
+        engine = gEngine;
+    }
+    return static_cast<jint>(engine->start());
+}
+
+JNIEXPORT void JNICALL
+Java_com_elg_piano_NativeEngine_nativeStop(JNIEnv*, jobject) {
+    std::shared_ptr<Engine> engine;
+    {
+        std::lock_guard<std::mutex> lock(gEngineMutex);
+        engine = std::move(gEngine);
+        gEngine.reset();
+    }
+    if (engine) engine->stop();
+}
+
+JNIEXPORT void JNICALL
+Java_com_elg_piano_NativeEngine_nativePause(JNIEnv*, jobject) {
+    std::shared_ptr<Engine> engine = getEngine();
+    if (engine) engine->pause();
+}
+
+JNIEXPORT void JNICALL
+Java_com_elg_piano_NativeEngine_nativeResume(JNIEnv*, jobject) {
+    std::shared_ptr<Engine> engine = getEngine();
+    if (engine) engine->resume();
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_elg_piano_NativeEngine_nativeLoad(JNIEnv* env, jobject, jint index, jstring path) {
+    std::shared_ptr<Engine> engine = getEngine();
+    if (!engine || path == nullptr) return JNI_FALSE;
+    const char* cpath = env->GetStringUTFChars(path, nullptr);
+    if (cpath == nullptr) return JNI_FALSE;
+    const bool ok = engine->loadFont(static_cast<int>(index), cpath);
+    env->ReleaseStringUTFChars(path, cpath);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL
+Java_com_elg_piano_NativeEngine_nativeNoteOn(JNIEnv*, jobject, jint note, jfloat velocity) {
+    std::shared_ptr<Engine> engine = getEngine();
+    if (!engine || note < 0 || note > 127) return;
+    float v = velocity;
+    if (v < 0.05f) v = 0.05f;
+    if (v > 1.0f) v = 1.0f;
+    engine->send(CMD_NOTE_ON, static_cast<int>(note), v);
+}
+
+JNIEXPORT void JNICALL
+Java_com_elg_piano_NativeEngine_nativeNoteOff(JNIEnv*, jobject, jint note) {
+    std::shared_ptr<Engine> engine = getEngine();
+    if (!engine || note < 0 || note > 127) return;
+    engine->send(CMD_NOTE_OFF, static_cast<int>(note), 0.0f);
+}
+
+JNIEXPORT void JNICALL
+Java_com_elg_piano_NativeEngine_nativeAllNotesOff(JNIEnv*, jobject) {
+    std::shared_ptr<Engine> engine = getEngine();
+    if (engine) engine->send(CMD_ALL_OFF, 0, 0.0f);
+}
+
+JNIEXPORT void JNICALL
+Java_com_elg_piano_NativeEngine_nativeSetInstrument(JNIEnv*, jobject, jint index) {
+    std::shared_ptr<Engine> engine = getEngine();
+    if (engine) engine->send(CMD_SET_INSTRUMENT, static_cast<int>(index), 0.0f);
+}
+
+JNIEXPORT void JNICALL
+Java_com_elg_piano_NativeEngine_nativeSetSustain(JNIEnv*, jobject, jboolean on) {
+    std::shared_ptr<Engine> engine = getEngine();
+    if (engine) engine->send(CMD_SUSTAIN, on ? 1 : 0, 0.0f);
+}
+
+JNIEXPORT void JNICALL
+Java_com_elg_piano_NativeEngine_nativeSetReverb(JNIEnv*, jobject, jfloat level) {
+    std::shared_ptr<Engine> engine = getEngine();
+    if (engine) engine->setReverb(level);
+}
+
+JNIEXPORT void JNICALL
+Java_com_elg_piano_NativeEngine_nativeSetVolume(JNIEnv*, jobject, jfloat volume) {
+    std::shared_ptr<Engine> engine = getEngine();
+    if (engine) engine->setVolume(volume);
+}
+
+}  // extern "C"
+EOF_ENGINE
+
+# TinySoundFont : en-tête unique téléchargé (le workflow GitHub le re-télécharge s'il manque)
+mkdir -p "$CPP_DIR"
+if [ -s "$CPP_DIR/tsf.h" ] && grep -q "TSF_IMPLEMENTATION" "$CPP_DIR/tsf.h"; then
+  log "  tsf.h déjà présent"
+elif command -v curl >/dev/null 2>&1 && curl -fsSL --max-time 60 -o "$CPP_DIR/tsf.h" "$TSF_URL" && grep -q "TSF_IMPLEMENTATION" "$CPP_DIR/tsf.h"; then
+  log "  tsf.h téléchargé"
+else
+  rm -f "$CPP_DIR/tsf.h"
+  warn "tsf.h non téléchargé (pas d'accès réseau). Le workflow GitHub Actions le téléchargera automatiquement."
+fi
+
+# -----------------------------------------------------------------------------
+# 4. Code Kotlin
+# -----------------------------------------------------------------------------
+log "Étape 4/7 : code Kotlin"
+mkdir -p "$PKG_DIR"
+cat > "$PKG_DIR/Instrument.kt" <<'EOF_INSTRUMENT'
+package com.elg.piano
+
+/**
+ * Les deux instruments embarqués. L'ordinal sert d'index côté moteur natif.
+ */
+enum class Instrument(val label: String, val assetName: String) {
+    GRAND_PIANO("Steinway B", "StudioOne_Steinway_B.sf2"),
+    BRIGHT_SYNTH("Synthé brillant", "Bright_Synth.sf2")
+}
+EOF_INSTRUMENT
+
+mkdir -p "$PKG_DIR"
+cat > "$PKG_DIR/NativeEngine.kt" <<'EOF_NATIVEENGINE'
+package com.elg.piano
+
+/**
+ * Pont JNI vers le moteur Oboe + TinySoundFont (libelgpiano.so).
+ */
+object NativeEngine {
+    init {
+        System.loadLibrary("elgpiano")
+    }
+
+    /** Ouvre le flux audio. Retourne la fréquence d'échantillonnage, ou 0 en cas d'échec. */
+    external fun nativeStart(): Int
+    external fun nativeStop()
+    external fun nativePause()
+    external fun nativeResume()
+    external fun nativeLoad(index: Int, path: String): Boolean
+    external fun nativeNoteOn(note: Int, velocity: Float)
+    external fun nativeNoteOff(note: Int)
+    external fun nativeAllNotesOff()
+    external fun nativeSetInstrument(index: Int)
+
+    /** Pédale forte (CC 64) : true = enfoncée. */
+    external fun nativeSetSustain(on: Boolean)
+
+    /** Niveau de réverbération, de 0.0 (aucune) à 1.0. */
+    external fun nativeSetReverb(level: Float)
+
+    /** Volume maître, de 0.0 à 1.0. */
+    external fun nativeSetVolume(volume: Float)
+}
+EOF_NATIVEENGINE
+
+mkdir -p "$PKG_DIR"
+cat > "$PKG_DIR/SoundFontInstaller.kt" <<'EOF_INSTALLER'
+package com.elg.piano
+
+import android.content.Context
+import java.io.File
+import java.io.IOException
+
+/**
+ * Copie un SoundFont embarqué (assets) vers le stockage interne de l'application,
+ * uniquement quand il est demandé. La copie est refaite à chaque nouvelle version.
+ * Aucun fichier fourni par l'utilisateur n'est accepté.
+ */
+object SoundFontInstaller {
+    private const val ASSET_DIR = "soundfonts"
+
+    fun ensureInstalled(context: Context, instrument: Instrument): File {
+        val dir = File(context.filesDir, ASSET_DIR)
+        if (!dir.exists() && !dir.mkdirs()) {
+            throw IOException("Impossible de créer le dossier ${dir.absolutePath}")
+        }
+        cleanup(dir)
+
+        val version = currentVersionCode(context).toString()
+        val target = File(dir, instrument.assetName)
+        val marker = File(dir, instrument.assetName + ".version")
+        val upToDate = target.exists() && target.length() > 0L &&
+            marker.exists() && marker.readText().trim() == version
+
+        if (!upToDate) {
+            val temp = File(dir, instrument.assetName + ".tmp")
+            context.assets.open("$ASSET_DIR/${instrument.assetName}").use { input ->
+                temp.outputStream().use { output -> input.copyTo(output, 256 * 1024) }
+            }
+            if (target.exists() && !target.delete()) {
+                throw IOException("Impossible de remplacer ${target.name}")
+            }
+            if (!temp.renameTo(target)) {
+                throw IOException("Impossible de finaliser ${target.name}")
+            }
+            marker.writeText(version)
+        }
+
+        checkSoundFontHeader(target)
+        return target
+    }
+
+    /** Supprime les fichiers qui ne correspondent à aucun instrument actuel (anciennes versions). */
+    private fun cleanup(dir: File) {
+        val known = HashSet<String>()
+        for (instrument in Instrument.entries) {
+            known.add(instrument.assetName)
+            known.add(instrument.assetName + ".version")
+        }
+        dir.listFiles()?.forEach { file ->
+            if (file.name !in known) file.delete()
+        }
+    }
+
+    private fun checkSoundFontHeader(file: File) {
+        val header = ByteArray(12)
+        file.inputStream().use { stream ->
+            var read = 0
+            while (read < header.size) {
+                val n = stream.read(header, read, header.size - read)
+                if (n < 0) break
+                read += n
+            }
+            if (read < header.size) throw IOException("${file.name} est tronqué")
+        }
+        val riff = String(header, 0, 4, Charsets.ISO_8859_1)
+        val form = String(header, 8, 4, Charsets.ISO_8859_1)
+        if (riff != "RIFF" || form != "sfbk") {
+            throw IOException("${file.name} n'est pas un SoundFont 2 valide")
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun currentVersionCode(context: Context): Long =
+        context.packageManager.getPackageInfo(context.packageName, 0).longVersionCode
+}
+EOF_INSTALLER
+
+mkdir -p "$PKG_DIR"
+cat > "$PKG_DIR/PianoViewModel.kt" <<'EOF_VIEWMODEL'
+package com.elg.piano
+
+import android.app.Application
+import android.content.Context
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import com.elg.piano.midi.MidiController
+import com.elg.piano.midi.MidiEventListener
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.updateAndGet
+import kotlinx.coroutines.launch
+
+data class PianoUiState(
+    val instrument: Instrument = Instrument.GRAND_PIANO,
+    val loaded: Set<Instrument> = emptySet(),
+    val loadingInstrument: Instrument? = null,
+    val pressed: Set<Int> = emptySet(),
+    val visibleKeys: Int = 14,
+    val reverb: Float = 0.3f,
+    val volume: Float = 0.8f,
+    val noteNames: Boolean = false,
+    val pedalHeld: Boolean = false,
+    val sustainLatch: Boolean = false,
+    val midiSustain: Boolean = false,
+    val error: String? = null
+) {
+    /** La pédale forte est active si l'une des trois sources l'est. */
+    val sustain: Boolean get() = pedalHeld || sustainLatch || midiSustain
+}
+
+class PianoViewModel(application: Application) : AndroidViewModel(application) {
+
+    private val prefs = application.getSharedPreferences("elg_piano_prefs", Context.MODE_PRIVATE)
+
+    private val _state = MutableStateFlow(
+        PianoUiState(
+            instrument = Instrument.entries.getOrElse(prefs.getInt("instrument", 0)) { Instrument.GRAND_PIANO },
+            visibleKeys = prefs.getInt("visible_keys", 14).coerceIn(7, 21),
+            reverb = prefs.getFloat("reverb", 0.3f).coerceIn(0f, 1f),
+            volume = prefs.getFloat("volume", 0.8f).coerceIn(0f, 1f),
+            noteNames = prefs.getBoolean("note_names", false)
+        )
+    )
+    val state: StateFlow<PianoUiState> = _state.asStateFlow()
+
+    // Nombre de doigts / sources posés par note (touches tactiles et clavier MIDI).
+    private val pressLock = Any()
+    private val pressCount = IntArray(128)
+
+    private val midiListener = object : MidiEventListener {
+        override fun onNoteOn(note: Int, velocity: Float) {
+            noteOn(note, velocity)
+        }
+
+        override fun onNoteOff(note: Int) {
+            noteOff(note)
+        }
+
+        override fun onSustain(on: Boolean) {
+            setMidiSustain(on)
+        }
+
+        override fun onAllNotesOff() {
+            releaseAll()
+        }
+    }
+
+    val midi = MidiController(application, midiListener)
+
+    init {
+        midi.start()
+        viewModelScope.launch(Dispatchers.IO) { boot() }
+    }
+
+    // -------------------------------------------------------------------------
+    // Démarrage : seul l'instrument actif est copié et chargé (démarrage rapide,
+    // mémoire économisée). L'autre est chargé à la première sélection.
+    // -------------------------------------------------------------------------
+
+    private fun boot() {
+        try {
+            val sampleRate = NativeEngine.nativeStart()
+            if (sampleRate <= 0) throw IllegalStateException("Moteur audio indisponible")
+
+            val s = _state.value
+            NativeEngine.nativeSetReverb(s.reverb)
+            NativeEngine.nativeSetVolume(s.volume)
+
+            loadInstrument(s.instrument)
+            NativeEngine.nativeSetInstrument(s.instrument.ordinal)
+        } catch (e: Exception) {
+            _state.update { it.copy(error = e.message ?: "Erreur inconnue") }
+        }
+    }
+
+    private fun loadInstrument(instrument: Instrument) {
+        val file = SoundFontInstaller.ensureInstalled(getApplication(), instrument)
+        if (!NativeEngine.nativeLoad(instrument.ordinal, file.absolutePath)) {
+            throw IllegalStateException("Échec du chargement : ${instrument.label}")
+        }
+        _state.update { it.copy(loaded = it.loaded + instrument) }
+    }
+
+    // -------------------------------------------------------------------------
+    // Jeu (tactile et MIDI)
+    // -------------------------------------------------------------------------
+
+    fun noteOn(note: Int, velocity: Float) {
+        if (note !in 0..127) return
+        synchronized(pressLock) { pressCount[note]++ }
+        NativeEngine.nativeNoteOn(note, velocity)
+        _state.update { it.copy(pressed = it.pressed + note) }
+    }
+
+    fun noteOff(note: Int) {
+        if (note !in 0..127) return
+        val release = synchronized(pressLock) {
+            if (pressCount[note] == 0) {
+                false
+            } else {
+                pressCount[note]--
+                pressCount[note] == 0
+            }
+        }
+        if (release) {
+            NativeEngine.nativeNoteOff(note)
+            _state.update { it.copy(pressed = it.pressed - note) }
+        }
+    }
+
+    private fun releaseAll() {
+        synchronized(pressLock) { pressCount.fill(0) }
+        NativeEngine.nativeAllNotesOff()
+        _state.update { it.copy(pressed = emptySet()) }
+    }
+
+    // -------------------------------------------------------------------------
+    // Pédale forte
+    // -------------------------------------------------------------------------
+
+    fun setPedalHeld(held: Boolean) {
+        val s = _state.updateAndGet { it.copy(pedalHeld = held) }
+        NativeEngine.nativeSetSustain(s.sustain)
+    }
+
+    fun setSustainLatch(latch: Boolean) {
+        val s = _state.updateAndGet { it.copy(sustainLatch = latch) }
+        NativeEngine.nativeSetSustain(s.sustain)
+    }
+
+    private fun setMidiSustain(on: Boolean) {
+        val s = _state.updateAndGet { it.copy(midiSustain = on) }
+        NativeEngine.nativeSetSustain(s.sustain)
+    }
+
+    // -------------------------------------------------------------------------
+    // Instruments
+    // -------------------------------------------------------------------------
+
+    fun selectInstrument(instrument: Instrument) {
+        val s = _state.value
+        if (instrument == s.instrument || s.loadingInstrument != null) return
+        if (instrument in s.loaded) {
+            switchTo(instrument)
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            _state.update { it.copy(loadingInstrument = instrument) }
+            try {
+                loadInstrument(instrument)
+                switchTo(instrument)
+            } catch (e: Exception) {
+                _state.update { it.copy(error = e.message ?: "Erreur inconnue") }
+            } finally {
+                _state.update { it.copy(loadingInstrument = null) }
+            }
+        }
+    }
+
+    private fun switchTo(instrument: Instrument) {
+        releaseAll()
+        NativeEngine.nativeSetInstrument(instrument.ordinal)
+        _state.update { it.copy(instrument = instrument) }
+        prefs.edit().putInt("instrument", instrument.ordinal).apply()
+    }
+
+    // -------------------------------------------------------------------------
+    // Réglages (persistants)
+    // -------------------------------------------------------------------------
+
+    fun setVisibleKeys(count: Int) {
+        val value = count.coerceIn(7, 21)
+        _state.update { it.copy(visibleKeys = value) }
+        prefs.edit().putInt("visible_keys", value).apply()
+    }
+
+    fun setReverb(level: Float) {
+        val value = level.coerceIn(0f, 1f)
+        NativeEngine.nativeSetReverb(value)
+        _state.update { it.copy(reverb = value) }
+        prefs.edit().putFloat("reverb", value).apply()
+    }
+
+    fun setVolume(volume: Float) {
+        val value = volume.coerceIn(0f, 1f)
+        NativeEngine.nativeSetVolume(value)
+        _state.update { it.copy(volume = value) }
+        prefs.edit().putFloat("volume", value).apply()
+    }
+
+    fun setNoteNames(show: Boolean) {
+        _state.update { it.copy(noteNames = show) }
+        prefs.edit().putBoolean("note_names", show).apply()
+    }
+
+    // -------------------------------------------------------------------------
+    // Cycle de vie
+    // -------------------------------------------------------------------------
+
+    fun onAppBackground() {
+        releaseAll()
+        val s = _state.updateAndGet { it.copy(pedalHeld = false) }
+        NativeEngine.nativeSetSustain(s.sustain)
+        NativeEngine.nativePause()
+    }
+
+    fun onAppForeground() {
+        NativeEngine.nativeResume()
+    }
+
+    override fun onCleared() {
+        midi.stop()
+        NativeEngine.nativeStop()
+        super.onCleared()
+    }
+}
+EOF_VIEWMODEL
+
+mkdir -p "$MIDI_DIR"
+cat > "$MIDI_DIR/MidiEvents.kt" <<'EOF_MIDIEVENTS'
+package com.elg.piano.midi
+
+import android.media.midi.MidiReceiver
+
+/** Événements MIDI utiles à l'application. */
+interface MidiEventListener {
+    fun onNoteOn(note: Int, velocity: Float)
+    fun onNoteOff(note: Int)
+    fun onSustain(on: Boolean)
+    fun onAllNotesOff()
+}
+
+/**
+ * Analyseur de flux MIDI (gère le running status, ignore les messages système).
+ * Tous les canaux sont acceptés.
+ */
+class MidiParser(private val listener: MidiEventListener) : MidiReceiver() {
+    private var status = 0
+    private var data1 = -1
+    private var inSysex = false
+
+    override fun onSend(msg: ByteArray, offset: Int, count: Int, timestamp: Long) {
+        for (i in offset until offset + count) {
+            val b = msg[i].toInt() and 0xFF
+            if (b >= 0xF8) continue  // messages temps réel : ignorés
+            if (b >= 0x80) {
+                when {
+                    b == 0xF0 -> {
+                        inSysex = true
+                        status = 0
+                        data1 = -1
+                    }
+                    b == 0xF7 -> inSysex = false
+                    b >= 0xF0 -> {
+                        status = 0
+                        data1 = -1
+                    }
+                    else -> {
+                        inSysex = false
+                        status = b
+                        data1 = -1
+                    }
+                }
+                continue
+            }
+            if (inSysex || status == 0) continue
+            val type = status and 0xF0
+            if (type == 0xC0 || type == 0xD0) continue  // un seul octet de données : ignoré
+            if (data1 < 0) {
+                data1 = b
+            } else {
+                dispatch(type, data1, b)
+                data1 = -1
+            }
+        }
+    }
+
+    private fun dispatch(type: Int, d1: Int, d2: Int) {
+        when (type) {
+            0x90 -> if (d2 > 0) listener.onNoteOn(d1, d2 / 127f) else listener.onNoteOff(d1)
+            0x80 -> listener.onNoteOff(d1)
+            0xB0 -> when (d1) {
+                64 -> listener.onSustain(d2 >= 64)
+                120, 123 -> listener.onAllNotesOff()
+            }
+        }
+    }
+}
+EOF_MIDIEVENTS
+
+mkdir -p "$MIDI_DIR"
+cat > "$MIDI_DIR/MidiController.kt" <<'EOF_MIDICONTROLLER'
+package com.elg.piano.midi
+
+import android.Manifest
+import android.annotation.SuppressLint
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothManager
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
+import android.content.Context
+import android.content.pm.PackageManager
+import android.media.midi.MidiDevice
+import android.media.midi.MidiDeviceInfo
+import android.media.midi.MidiManager
+import android.media.midi.MidiOutputPort
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.os.ParcelUuid
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import java.io.IOException
+import java.util.UUID
+
+data class BleDevice(val name: String, val address: String, val device: BluetoothDevice)
+
+data class MidiUiState(
+    val connected: List<String> = emptyList(),
+    val scanning: Boolean = false,
+    val found: List<BleDevice> = emptyList(),
+    val message: String? = null
+)
+
+/**
+ * Détecte les claviers MIDI USB (OTG) et Bluetooth LE, et transmet leurs
+ * événements (Note On/Off, vélocité, pédale de sustain) à l'application.
+ * Toutes les opérations MIDI s'exécutent sur le thread principal.
+ */
+class MidiController(
+    private val context: Context,
+    private val listener: MidiEventListener
+) {
+    private class Connection(val device: MidiDevice, val port: MidiOutputPort, val name: String)
+
+    private val midiManager: MidiManager? =
+        if (context.packageManager.hasSystemFeature(PackageManager.FEATURE_MIDI)) {
+            context.getSystemService(Context.MIDI_SERVICE) as? MidiManager
+        } else {
+            null
+        }
+
+    private val handler = Handler(Looper.getMainLooper())
+    private val connections = HashMap<Int, Connection>()
+
+    private val _state = MutableStateFlow(MidiUiState())
+    val state: StateFlow<MidiUiState> = _state.asStateFlow()
+
+    private var scanCallback: ScanCallback? = null
+    private val stopScanRunnable = Runnable { stopBleScan() }
+
+    private val deviceCallback = object : MidiManager.DeviceCallback() {
+        override fun onDeviceAdded(device: MidiDeviceInfo) {
+            openDevice(device)
+        }
+
+        override fun onDeviceRemoved(device: MidiDeviceInfo) {
+            detach(device.id)
+        }
+    }
+
+    fun start() {
+        val manager = midiManager
+        if (manager == null) {
+            setMessage("MIDI non pris en charge sur cet appareil.")
+            return
+        }
+        manager.registerDeviceCallback(deviceCallback, handler)
+        for (info in existingDevices()) openDevice(info)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun existingDevices(): List<MidiDeviceInfo> =
+        midiManager?.devices?.toList() ?: emptyList()
+
+    fun stop() {
+        stopBleScan()
+        midiManager?.unregisterDeviceCallback(deviceCallback)
+        for (id in connections.keys.toList()) detach(id)
+    }
+
+    fun setMessage(text: String?) {
+        _state.update { it.copy(message = text) }
+    }
+
+    private fun openDevice(info: MidiDeviceInfo) {
+        val manager = midiManager ?: return
+        if (info.outputPortCount == 0 || connections.containsKey(info.id)) return
+        manager.openDevice(
+            info,
+            MidiManager.OnDeviceOpenedListener { device -> if (device != null) attach(device) },
+            handler
+        )
+    }
+
+    private fun attach(device: MidiDevice) {
+        val info = device.info
+        if (info.outputPortCount == 0 || connections.containsKey(info.id)) {
+            closeQuietly(device, null)
+            return
+        }
+        val port = device.openOutputPort(0)
+        if (port == null) {
+            closeQuietly(device, null)
+            return
+        }
+        port.connect(MidiParser(listener))
+        val name = info.properties.getString(MidiDeviceInfo.PROPERTY_NAME) ?: "Clavier MIDI"
+        connections[info.id] = Connection(device, port, name)
+        publishConnected()
+    }
+
+    private fun detach(id: Int) {
+        val connection = connections.remove(id) ?: return
+        closeQuietly(connection.device, connection.port)
+        publishConnected()
+        listener.onAllNotesOff()
+    }
+
+    private fun closeQuietly(device: MidiDevice, port: MidiOutputPort?) {
+        try {
+            port?.close()
+        } catch (e: IOException) {
+            // ignoré
+        }
+        try {
+            device.close()
+        } catch (e: IOException) {
+            // ignoré
+        }
+    }
+
+    private fun publishConnected() {
+        val names = connections.values.map { it.name }
+        _state.update { it.copy(connected = names) }
+    }
+
+    // -------------------------------------------------------------------------
+    // Bluetooth LE MIDI
+    // -------------------------------------------------------------------------
+
+    @SuppressLint("MissingPermission")
+    fun startBleScan() {
+        if (midiManager == null) {
+            setMessage("MIDI non pris en charge sur cet appareil.")
+            return
+        }
+        if (_state.value.scanning) return
+        val adapter = (context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
+        if (adapter == null || !adapter.isEnabled) {
+            setMessage("Activez le Bluetooth pour rechercher un clavier.")
+            return
+        }
+        val scanner = adapter.bluetoothLeScanner
+        if (scanner == null) {
+            setMessage("Recherche Bluetooth indisponible.")
+            return
+        }
+
+        val callback = object : ScanCallback() {
+            override fun onScanResult(callbackType: Int, result: ScanResult) {
+                val device = result.device
+                val name = safeName(device)
+                _state.update { s ->
+                    if (s.found.any { it.address == device.address }) {
+                        s
+                    } else {
+                        s.copy(found = s.found + BleDevice(name, device.address, device))
+                    }
+                }
+            }
+
+            override fun onScanFailed(errorCode: Int) {
+                scanCallback = null
+                handler.removeCallbacks(stopScanRunnable)
+                _state.update { it.copy(scanning = false, message = "Échec de la recherche Bluetooth ($errorCode).") }
+            }
+        }
+
+        val filter = ScanFilter.Builder().setServiceUuid(ParcelUuid(BLE_MIDI_SERVICE)).build()
+        val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
+        try {
+            scanner.startScan(listOf(filter), settings, callback)
+        } catch (e: SecurityException) {
+            setMessage("Permission Bluetooth refusée.")
+            return
+        } catch (e: IllegalStateException) {
+            setMessage("Recherche Bluetooth impossible.")
+            return
+        }
+        scanCallback = callback
+        _state.update { it.copy(scanning = true, found = emptyList(), message = null) }
+        handler.postDelayed(stopScanRunnable, SCAN_DURATION_MS)
+    }
+
+    @SuppressLint("MissingPermission")
+    fun stopBleScan() {
+        handler.removeCallbacks(stopScanRunnable)
+        val callback = scanCallback
+        scanCallback = null
+        if (callback != null) {
+            try {
+                val adapter = (context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
+                adapter?.bluetoothLeScanner?.stopScan(callback)
+            } catch (e: SecurityException) {
+                // ignoré
+            } catch (e: IllegalStateException) {
+                // ignoré
+            }
+        }
+        _state.update { it.copy(scanning = false) }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun connectBle(target: BleDevice) {
+        val manager = midiManager ?: return
+        stopBleScan()
+        setMessage("Connexion à ${target.name}…")
+        try {
+            manager.openBluetoothDevice(
+                target.device,
+                MidiManager.OnDeviceOpenedListener { device ->
+                    if (device != null) {
+                        attach(device)
+                        setMessage(null)
+                    } else {
+                        setMessage("Connexion Bluetooth impossible.")
+                    }
+                },
+                handler
+            )
+        } catch (e: SecurityException) {
+            setMessage("Permission Bluetooth refusée.")
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun safeName(device: BluetoothDevice): String {
+        val name = try {
+            device.name
+        } catch (e: SecurityException) {
+            null
+        }
+        return name ?: device.address
+    }
+
+    companion object {
+        private val BLE_MIDI_SERVICE: UUID = UUID.fromString("03B80E5A-EDE8-4B33-A751-6CE34EC4C700")
+        private const val SCAN_DURATION_MS = 12_000L
+
+        /** Permissions nécessaires à la recherche d'un clavier Bluetooth. */
+        fun blePermissions(): Array<String> =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
+            } else {
+                arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+            }
+    }
+}
+EOF_MIDICONTROLLER
+
+mkdir -p "$PKG_DIR"
+cat > "$PKG_DIR/MainActivity.kt" <<'EOF_MAINACTIVITY'
+package com.elg.piano
+
+import android.os.Bundle
+import android.view.WindowManager
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import com.elg.piano.ui.ElgPianoTheme
+import com.elg.piano.ui.PianoScreen
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        setContent {
+            ElgPianoTheme {
+                PianoScreen()
+            }
+        }
+    }
+}
+EOF_MAINACTIVITY
+
+mkdir -p "$UI_DIR"
+cat > "$UI_DIR/Theme.kt" <<'EOF_THEME'
+package com.elg.piano.ui
+
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.graphics.Color
+
+@Composable
+fun ElgPianoTheme(content: @Composable () -> Unit) {
+    MaterialTheme(
+        colorScheme = darkColorScheme(
+            primary = Color(0xFF7FB2FF),
+            background = Color(0xFF121214),
+            surface = Color(0xFF1C1C1E)
+        ),
+        content = content
+    )
+}
+EOF_THEME
+
+mkdir -p "$UI_DIR"
+cat > "$UI_DIR/PianoKeyboard.kt" <<'EOF_KEYBOARD'
+package com.elg.piano.ui
+
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.translate
+import androidx.compose.ui.input.pointer.PointerId
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.drawText
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.unit.sp
+
+const val FIRST_NOTE = 21        // A0
+const val LAST_NOTE = 108        // C8
+const val WHITE_KEY_COUNT = 52   // touches blanches d'un clavier de 88 touches
+
+private val BLACK_PITCH_CLASSES = setOf(1, 3, 6, 8, 10)
+
+private val FRENCH_NAMES = mapOf(
+    0 to "Do", 2 to "Ré", 4 to "Mi", 5 to "Fa", 7 to "Sol", 9 to "La", 11 to "Si"
+)
+
+class KeyRect(val midi: Int, val x: Float, val width: Float)
+
+/** Géométrie du clavier 88 touches, en pixels (non défilée). */
+class KeyboardLayout(val whiteWidth: Float, val height: Float) {
+    val blackWidth: Float = whiteWidth * 0.62f
+    val blackHeight: Float = height * 0.62f
+    val totalWidth: Float = whiteWidth * WHITE_KEY_COUNT
+    val whites: List<KeyRect>
+    val blacks: List<KeyRect>
+
+    init {
+        val whiteList = ArrayList<KeyRect>(WHITE_KEY_COUNT)
+        val blackList = ArrayList<KeyRect>(36)
+        var whiteIndex = 0
+        for (midi in FIRST_NOTE..LAST_NOTE) {
+            if (midi % 12 in BLACK_PITCH_CLASSES) {
+                blackList.add(KeyRect(midi, whiteIndex * whiteWidth - blackWidth / 2f, blackWidth))
+            } else {
+                whiteList.add(KeyRect(midi, whiteIndex * whiteWidth, whiteWidth))
+                whiteIndex++
+            }
+        }
+        whites = whiteList
+        blacks = blackList
+    }
+
+    /** Note MIDI sous le point (x, y) en coordonnées de clavier, ou null en dehors. */
+    fun hit(x: Float, y: Float): Int? {
+        if (x < 0f || x >= totalWidth || y < 0f || y > height) return null
+        if (y <= blackHeight) {
+            for (key in blacks) {
+                if (x >= key.x && x < key.x + key.width) return key.midi
+            }
+        }
+        val index = (x / whiteWidth).toInt().coerceIn(0, whites.size - 1)
+        return whites[index].midi
+    }
+}
+
+/** Vélocité selon la hauteur du toucher : doux en haut de la touche, fort en bas. */
+private fun velocityFor(y: Float, height: Float): Float =
+    (0.45f + 0.55f * (y / height)).coerceIn(0.3f, 1f)
+
+private fun labelFor(midi: Int, showNames: Boolean): String? {
+    val octave = midi / 12 - 1
+    val pitchClass = midi % 12
+    return if (showNames) {
+        FRENCH_NAMES[pitchClass]?.let { name -> if (pitchClass == 0) "$name$octave" else name }
+    } else {
+        if (pitchClass == 0) "C$octave" else null
+    }
+}
+
+/**
+ * Clavier 88 touches multi-touch. [leftKey] est l'indice (fractionnaire) de la
+ * touche blanche affichée à gauche : le défilement est piloté par l'application
+ * (curseur, boutons d'octave), jamais par le doigt, pour ne pas gêner le jeu.
+ */
+@Composable
+fun PianoKeyboard(
+    pressed: Set<Int>,
+    visibleWhiteKeys: Int,
+    leftKey: Float,
+    showNoteNames: Boolean,
+    onNoteOn: (Int, Float) -> Unit,
+    onNoteOff: (Int) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    BoxWithConstraints(modifier = modifier.clipToBounds()) {
+        val density = LocalDensity.current
+        val widthPx = with(density) { maxWidth.toPx() }
+        val heightPx = with(density) { maxHeight.toPx() }
+        val layout = remember(widthPx, heightPx, visibleWhiteKeys) {
+            KeyboardLayout(widthPx / visibleWhiteKeys, heightPx)
+        }
+        val offsetPx = leftKey * layout.whiteWidth
+        val offsetState by rememberUpdatedState(offsetPx)
+        val noteOnState by rememberUpdatedState(onNoteOn)
+        val noteOffState by rememberUpdatedState(onNoteOff)
+        val textMeasurer = rememberTextMeasurer()
+
+        Canvas(
+            modifier = Modifier
+                .fillMaxSize()
+                .pointerInput(layout) {
+                    val active = HashMap<PointerId, Int>()
+                    try {
+                        awaitPointerEventScope {
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                for (change in event.changes) {
+                                    val current = active[change.id]
+                                    if (change.pressed) {
+                                        val note = layout.hit(
+                                            change.position.x + offsetState,
+                                            change.position.y
+                                        )
+                                        val velocity = velocityFor(change.position.y, layout.height)
+                                        if (current == null) {
+                                            if (note != null) {
+                                                active[change.id] = note
+                                                noteOnState(note, velocity)
+                                            }
+                                        } else if (note != current) {
+                                            noteOffState(current)
+                                            if (note != null) {
+                                                active[change.id] = note
+                                                noteOnState(note, velocity)
+                                            } else {
+                                                active.remove(change.id)
+                                            }
+                                        }
+                                        change.consume()
+                                    } else if (current != null) {
+                                        noteOffState(current)
+                                        active.remove(change.id)
+                                        change.consume()
+                                    }
+                                }
+                            }
+                        }
+                    } finally {
+                        for (note in active.values) noteOffState(note)
+                        active.clear()
+                    }
+                }
+        ) {
+            val labelStyle = TextStyle(
+                color = Color(0xFF6A6A6A),
+                fontSize = if (showNoteNames) 10.sp else 11.sp
+            )
+            val viewRight = offsetPx + size.width
+
+            translate(left = -offsetPx) {
+                for (key in layout.whites) {
+                    if (key.x + key.width < offsetPx || key.x > viewRight) continue
+                    val isPressed = key.midi in pressed
+                    drawRect(
+                        color = if (isPressed) Color(0xFF9CC4FF) else Color(0xFFF8F8F4),
+                        topLeft = Offset(key.x, 0f),
+                        size = Size(key.width, size.height)
+                    )
+                    drawRect(
+                        color = Color(0xFF3A3A3A),
+                        topLeft = Offset(key.x, 0f),
+                        size = Size(key.width, size.height),
+                        style = Stroke(width = 1.5f)
+                    )
+                    val label = labelFor(key.midi, showNoteNames)
+                    if (label != null) {
+                        drawText(
+                            textMeasurer = textMeasurer,
+                            text = label,
+                            topLeft = Offset(key.x + 5f, size.height - 30f),
+                            style = labelStyle
+                        )
+                    }
+                }
+
+                for (key in layout.blacks) {
+                    if (key.x + key.width < offsetPx || key.x > viewRight) continue
+                    val isPressed = key.midi in pressed
+                    drawRoundRect(
+                        color = if (isPressed) Color(0xFF4F83CC) else Color(0xFF1A1A1C),
+                        topLeft = Offset(key.x, 0f),
+                        size = Size(key.width, layout.blackHeight),
+                        cornerRadius = CornerRadius(6f, 6f)
+                    )
+                }
+            }
+        }
+    }
+}
+EOF_KEYBOARD
+
+mkdir -p "$UI_DIR"
+cat > "$UI_DIR/PianoScreen.kt" <<'EOF_SCREEN'
+package com.elg.piano.ui
+
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.Animatable
+import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Slider
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.elg.piano.Instrument
+import com.elg.piano.PianoViewModel
+import com.elg.piano.midi.MidiController
+import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
+
+@Composable
+fun PianoScreen(viewModel: PianoViewModel = viewModel()) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    val midiState by viewModel.midi.state.collectAsStateWithLifecycle()
+    val scope = rememberCoroutineScope()
+    var showSettings by remember { mutableStateOf(false) }
+    var showMidi by remember { mutableStateOf(false) }
+
+    // Position (fractionnaire) de la touche blanche affichée à gauche ; 16 = Do3.
+    val maxLeft = (WHITE_KEY_COUNT - state.visibleKeys).toFloat()
+    val leftKey = remember { Animatable(16f) }
+    LaunchedEffect(maxLeft) {
+        if (leftKey.value > maxLeft) leftKey.snapTo(maxLeft)
+    }
+
+    LifecycleEventEffect(Lifecycle.Event.ON_STOP) { viewModel.onAppBackground() }
+    LifecycleEventEffect(Lifecycle.Event.ON_START) { viewModel.onAppForeground() }
+
+    fun shiftOctave(direction: Int) {
+        scope.launch {
+            leftKey.animateTo((leftKey.value + direction * 7f).coerceIn(0f, maxLeft))
+        }
+    }
+
+    val error = state.error
+    val busyInstrument = state.loadingInstrument ?: if (state.instrument !in state.loaded) state.instrument else null
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF121214))
+            .safeDrawingPadding()
+            .padding(horizontal = 12.dp, vertical = 6.dp)
+    ) {
+        // --- Barre du haut -----------------------------------------------------
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text(
+                text = "ELG Piano",
+                color = Color.White,
+                style = MaterialTheme.typography.titleMedium
+            )
+            for (instrument in Instrument.entries) {
+                FilterChip(
+                    selected = state.instrument == instrument,
+                    enabled = state.loadingInstrument == null,
+                    onClick = { viewModel.selectInstrument(instrument) },
+                    label = { Text(instrument.label) }
+                )
+            }
+            PedalButton(active = state.sustain, onHold = viewModel::setPedalHeld)
+            FilterChip(
+                selected = state.sustainLatch,
+                onClick = { viewModel.setSustainLatch(!state.sustainLatch) },
+                label = { Text("Maintien") }
+            )
+            OutlinedButton(onClick = { showMidi = true }) {
+                Text(if (midiState.connected.isEmpty()) "MIDI" else "MIDI (${midiState.connected.size})")
+            }
+            OutlinedButton(onClick = { showSettings = !showSettings }) {
+                Text(if (showSettings) "Réglages ▲" else "Réglages ▼")
+            }
+        }
+
+        if (error != null) {
+            Text(
+                text = error,
+                color = Color(0xFFFF8A80),
+                modifier = Modifier.padding(vertical = 4.dp)
+            )
+        } else if (busyInstrument != null) {
+            Row(
+                modifier = Modifier.padding(vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                Text(text = "Chargement : ${busyInstrument.label}…", color = Color.LightGray)
+            }
+        }
+
+        // --- Réglages ----------------------------------------------------------
+        if (showSettings) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                LabeledSlider(
+                    label = "Touches visibles",
+                    valueText = "${state.visibleKeys}",
+                    value = state.visibleKeys.toFloat(),
+                    range = 7f..21f,
+                    steps = 13,
+                    onChange = { viewModel.setVisibleKeys(it.roundToInt()) },
+                    modifier = Modifier.weight(1f)
+                )
+                LabeledSlider(
+                    label = "Réverbération",
+                    valueText = "${(state.reverb * 100).roundToInt()} %",
+                    value = state.reverb,
+                    range = 0f..1f,
+                    steps = 0,
+                    onChange = { viewModel.setReverb(it) },
+                    modifier = Modifier.weight(1f)
+                )
+                LabeledSlider(
+                    label = "Volume",
+                    valueText = "${(state.volume * 100).roundToInt()} %",
+                    value = state.volume,
+                    range = 0f..1f,
+                    steps = 0,
+                    onChange = { viewModel.setVolume(it) },
+                    modifier = Modifier.weight(1f)
+                )
+                FilterChip(
+                    selected = state.noteNames,
+                    onClick = { viewModel.setNoteNames(!state.noteNames) },
+                    label = { Text("Do Ré Mi") }
+                )
+            }
+        }
+
+        // --- Navigation entre les octaves ----------------------------------------
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            OutlinedButton(onClick = { shiftOctave(-1) }) { Text("◀ Octave") }
+            Slider(
+                value = leftKey.value.coerceIn(0f, maxLeft),
+                onValueChange = { value -> scope.launch { leftKey.snapTo(value) } },
+                valueRange = 0f..maxLeft,
+                modifier = Modifier.weight(1f)
+            )
+            OutlinedButton(onClick = { shiftOctave(1) }) { Text("Octave ▶") }
+        }
+
+        // --- Clavier -------------------------------------------------------------
+        PianoKeyboard(
+            pressed = state.pressed,
+            visibleWhiteKeys = state.visibleKeys,
+            leftKey = leftKey.value,
+            showNoteNames = state.noteNames,
+            onNoteOn = viewModel::noteOn,
+            onNoteOff = viewModel::noteOff,
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f)
+                .padding(top = 4.dp)
+        )
+    }
+
+    if (showMidi) {
+        MidiDialog(
+            midi = viewModel.midi,
+            onDismiss = { showMidi = false }
+        )
+    }
+}
+
+/** Pédale forte : maintenue tant que le doigt reste posé sur le bouton. */
+@Composable
+private fun PedalButton(active: Boolean, onHold: (Boolean) -> Unit) {
+    Box(
+        modifier = Modifier
+            .height(40.dp)
+            .widthIn(min = 96.dp)
+            .background(
+                color = if (active) Color(0xFF3E78C9) else Color(0xFF2A2A2E),
+                shape = RoundedCornerShape(20.dp)
+            )
+            .pointerInput(Unit) {
+                detectTapGestures(
+                    onPress = {
+                        onHold(true)
+                        try {
+                            tryAwaitRelease()
+                        } finally {
+                            onHold(false)
+                        }
+                    }
+                )
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        Text(text = "Pédale", color = Color.White)
+    }
+}
+
+@Composable
+private fun LabeledSlider(
+    label: String,
+    valueText: String,
+    value: Float,
+    range: ClosedFloatingPointRange<Float>,
+    steps: Int,
+    onChange: (Float) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(modifier = modifier) {
+        Text(
+            text = "$label : $valueText",
+            color = Color.LightGray,
+            style = MaterialTheme.typography.labelMedium
+        )
+        Slider(
+            value = value,
+            onValueChange = onChange,
+            valueRange = range,
+            steps = steps
+        )
+    }
+}
+
+@Composable
+private fun MidiDialog(midi: MidiController, onDismiss: () -> Unit) {
+    val midiState by midi.state.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { result ->
+        if (result.values.all { it }) {
+            midi.startBleScan()
+        } else {
+            midi.setMessage("Permission Bluetooth refusée.")
+        }
+    }
+
+    fun close() {
+        midi.stopBleScan()
+        onDismiss()
+    }
+
+    AlertDialog(
+        onDismissRequest = { close() },
+        confirmButton = { TextButton(onClick = { close() }) { Text("Fermer") } },
+        title = { Text("Clavier MIDI") },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                if (midiState.connected.isEmpty()) {
+                    Text("Aucun clavier connecté. Branchez un clavier USB (adaptateur OTG) : il est détecté automatiquement.")
+                } else {
+                    for (name in midiState.connected) Text("✔ $name")
+                }
+                HorizontalDivider()
+                Text("Bluetooth")
+                OutlinedButton(
+                    enabled = !midiState.scanning,
+                    onClick = {
+                        val needed = MidiController.blePermissions()
+                        val granted = needed.all {
+                            ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
+                        }
+                        if (granted) midi.startBleScan() else permissionLauncher.launch(needed)
+                    }
+                ) {
+                    Text(if (midiState.scanning) "Recherche en cours…" else "Rechercher un clavier Bluetooth")
+                }
+                for (device in midiState.found) {
+                    TextButton(onClick = { midi.connectBle(device) }) { Text(device.name) }
+                }
+                val message = midiState.message
+                if (message != null) {
+                    Text(message, color = MaterialTheme.colorScheme.primary)
+                }
+                Spacer(modifier = Modifier.height(2.dp))
+            }
+        }
+    )
+}
+EOF_SCREEN
+
+# -----------------------------------------------------------------------------
+# 5. Manifeste et ressources
+# -----------------------------------------------------------------------------
+log "Étape 5/7 : manifeste et ressources"
+mkdir -p "$PROJECT_DIR/app/src/main"
+cat > "$PROJECT_DIR/app/src/main/AndroidManifest.xml" <<'EOF_MANIFEST'
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-feature android:name="android.software.midi" android:required="false" />
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.ELGPiano">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize"
+            android:launchMode="singleTop">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>
+EOF_MANIFEST
+
+mkdir -p "$RES_DIR/values"
+cat > "$RES_DIR/values/strings.xml" <<'EOF_STRINGS'
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ELG Piano</string>
+</resources>
+EOF_STRINGS
+
+mkdir -p "$RES_DIR/values"
+cat > "$RES_DIR/values/colors.xml" <<'EOF_COLORS'
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ic_launcher_background">#1F3A5F</color>
+    <color name="window_background">#121214</color>
+</resources>
+EOF_COLORS
+
+mkdir -p "$RES_DIR/values"
+cat > "$RES_DIR/values/themes.xml" <<'EOF_THEMES'
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.ELGPiano" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/window_background</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+</resources>
+EOF_THEMES
+
+mkdir -p "$RES_DIR/drawable"
+cat > "$RES_DIR/drawable/ic_launcher_foreground.xml" <<'EOF_ICONFG'
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#F5F5F0"
+        android:pathData="M30,34h48v40h-48z" />
+    <path
+        android:fillColor="#1C1C1E"
+        android:pathData="M38,34h6v24h-6z M51,34h6v24h-6z M64,34h6v24h-6z" />
+</vector>
+EOF_ICONFG
+
+mkdir -p "$RES_DIR/mipmap-anydpi-v26"
+cat > "$RES_DIR/mipmap-anydpi-v26/ic_launcher.xml" <<'EOF_ICON'
+<?xml version="1.0" encoding="utf-8"?>
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+</adaptive-icon>
+EOF_ICON
+
+# -----------------------------------------------------------------------------
+# 6. Workflow GitHub Actions
+# -----------------------------------------------------------------------------
+log "Étape 6/7 : workflow GitHub Actions"
+mkdir -p "$WORKFLOW_DIR"
+cat > "$WORKFLOW_DIR/build.yml" <<'EOF_WORKFLOW'
+name: Build ELG Piano APK
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          lfs: true
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # Le dépôt ne contient que setup_elg_piano_full.sh :
+      # ce script génère app/, Gradle, le code C++/Kotlin, etc.
+      - name: Generate project from setup script
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash setup_elg_piano_full.sh
+          ls -la
+          ls -la app/src/main/cpp
+
+      - name: Download SoundFonts from Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p app/src/main/assets/soundfonts
+          for f in StudioOne_Steinway_B.sf2 Bright_Synth.sf2; do
+            p="app/src/main/assets/soundfonts/$f"
+            if [ ! -s "$p" ]; then
+              gh release download soundfonts --repo "$GITHUB_REPOSITORY" \
+                --pattern "$f" --dir app/src/main/assets/soundfonts --clobber
+            fi
+          done
+          ls -lh app/src/main/assets/soundfonts
+
+      - name: Verify SoundFonts
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in StudioOne_Steinway_B.sf2 Bright_Synth.sf2; do
+            p="app/src/main/assets/soundfonts/$f"
+            test -s "$p" || { echo "Missing SoundFont: $p"; exit 1; }
+            test "$(head -c 4 "$p")" = "RIFF" || { echo "Invalid SoundFont: $p"; exit 1; }
+          done
+
+      - name: Ensure TinySoundFont (tsf.h)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p app/src/main/cpp
+          if ! grep -qs TSF_IMPLEMENTATION app/src/main/cpp/tsf.h; then
+            curl -fsSL --retry 3 --retry-delay 2 \
+              -o "$RUNNER_TEMP/tsf.h" \
+              https://raw.githubusercontent.com/schellingb/TinySoundFont/master/tsf.h
+            mv "$RUNNER_TEMP/tsf.h" app/src/main/cpp/tsf.h
+          fi
+          grep -q TSF_IMPLEMENTATION app/src/main/cpp/tsf.h
+
+      - name: Install Android SDK, NDK and CMake
+        shell: bash
+        run: |
+          set -eu
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0" "ndk;27.0.12077973" "cmake;3.22.1"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v5
+        with:
+          gradle-version: '8.9'
+
+      - name: Build Debug APK
+        run: gradle --no-daemon assembleDebug
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: ELG-Piano-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+EOF_WORKFLOW
+
+# -----------------------------------------------------------------------------
+# 6 bis. Fichiers module IntelliJ / Android Studio (.iml)
+# -----------------------------------------------------------------------------
+log "Étape 6 bis/7 : fichiers .iml"
+mkdir -p "$PROJECT_DIR"
+cat > "$PROJECT_DIR/ELG_Piano.iml" <<'EOF_IML_ROOT'
+<?xml version="1.0" encoding="UTF-8"?>
+<module external.linked.project.id="ELG Piano" external.linked.project.path="$MODULE_DIR$" external.root.project.path="$MODULE_DIR$" external.system.id="GRADLE" type="JAVA_MODULE" version="4">
+  <component name="FacetManager">
+    <facet type="android-gradle" name="Android-Gradle">
+      <configuration>
+        <option name="GRADLE_PROJECT_PATH" value=":" />
+      </configuration>
+    </facet>
+  </component>
+  <component name="NewModuleRootManager" LANGUAGE_LEVEL="JDK_17" inherit-compiler-output="true">
+    <exclude-output />
+    <content url="file://$MODULE_DIR$">
+      <excludeFolder url="file://$MODULE_DIR$/.gradle" />
+      <excludeFolder url="file://$MODULE_DIR$/.idea" />
+      <excludeFolder url="file://$MODULE_DIR$/build" />
+    </content>
+    <orderEntry type="jdk" jdkName="jbr-17" jdkType="JavaSDK" />
+    <orderEntry type="sourceFolder" forTests="false" />
+  </component>
+</module>
+EOF_IML_ROOT
+
+mkdir -p "$PROJECT_DIR/app"
+cat > "$PROJECT_DIR/app/app.iml" <<'EOF_IML_APP'
+<?xml version="1.0" encoding="UTF-8"?>
+<module external.linked.project.id="ELG Piano.app" external.linked.project.path="$MODULE_DIR$" external.root.project.path="$MODULE_DIR$/.." external.system.id="GRADLE" external.system.module.group="ELG Piano" external.system.module.version="0.2.0" type="JAVA_MODULE" version="4">
+  <component name="FacetManager">
+    <facet type="android-gradle" name="Android-Gradle">
+      <configuration>
+        <option name="GRADLE_PROJECT_PATH" value=":app" />
+      </configuration>
+    </facet>
+    <facet type="android" name="Android">
+      <configuration>
+        <option name="SELECTED_BUILD_VARIANT" value="debug" />
+        <option name="ALLOW_USER_CONFIGURATION" value="false" />
+        <option name="MANIFEST_FILE_RELATIVE_PATH" value="/src/main/AndroidManifest.xml" />
+        <option name="RES_FOLDER_RELATIVE_PATH" value="/src/main/res" />
+        <option name="ASSETS_FOLDER_RELATIVE_PATH" value="/src/main/assets" />
+      </configuration>
+    </facet>
+  </component>
+  <component name="NewModuleRootManager" LANGUAGE_LEVEL="JDK_17" inherit-compiler-output="true">
+    <exclude-output />
+    <content url="file://$MODULE_DIR$">
+      <sourceFolder url="file://$MODULE_DIR$/src/main/java" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/src/main/res" type="java-resource" />
+      <sourceFolder url="file://$MODULE_DIR$/src/main/assets" type="java-resource" />
+      <excludeFolder url="file://$MODULE_DIR$/build" />
+      <excludeFolder url="file://$MODULE_DIR$/.cxx" />
+      <excludeFolder url="file://$MODULE_DIR$/.externalNativeBuild" />
+    </content>
+    <orderEntry type="jdk" jdkName="jbr-17" jdkType="JavaSDK" />
+    <orderEntry type="sourceFolder" forTests="false" />
+  </component>
+</module>
+EOF_IML_APP
+
+# -----------------------------------------------------------------------------
+# 7. Contrôles finaux
+# -----------------------------------------------------------------------------
+log "Étape 7/7 : contrôles"
+for required in \
+  "$PROJECT_DIR/settings.gradle.kts" \
+  "$PROJECT_DIR/build.gradle.kts" \
+  "$PROJECT_DIR/app/build.gradle.kts" \
+  "$CPP_DIR/CMakeLists.txt" \
+  "$CPP_DIR/engine.cpp" \
+  "$CPP_DIR/tsf_impl.cpp" \
+  "$PKG_DIR/MainActivity.kt" \
+  "$PKG_DIR/PianoViewModel.kt" \
+  "$MIDI_DIR/MidiEvents.kt" \
+  "$MIDI_DIR/MidiController.kt" \
+  "$UI_DIR/PianoKeyboard.kt" \
+  "$UI_DIR/PianoScreen.kt" \
+  "$PROJECT_DIR/app/src/main/AndroidManifest.xml" \
+  "$WORKFLOW_DIR/build.yml"; do
+  [ -s "$required" ] || die "Fichier non généré : $required"
+done
+
+if command -v xmllint >/dev/null 2>&1; then
+  while IFS= read -r xml; do
+    xmllint --noout "$xml" || die "XML invalide : $xml"
+  done < <(find "$PROJECT_DIR/app/src/main" -name '*.xml' -type f)
+  xmllint --noout "$PROJECT_DIR/ELG_Piano.iml" "$PROJECT_DIR/app/app.iml" || die "Fichier .iml invalide"
+  log "  XML valides (xmllint)"
+else
+  warn "xmllint absent : validation XML ignorée."
+fi
+
+total_size=$(du -sk "$ASSETS_DIR" | cut -f1)
+log "Projet ELG Piano généré dans : $PROJECT_DIR"
+log "  SoundFonts embarqués : ${total_size} Ko"
+log "Suite : git add -A && git commit -m \"ELG Piano - étape 1\" && git push"
+log "Puis récupérez l'APK dans l'onglet Actions > ELG-Piano-debug-apk."
